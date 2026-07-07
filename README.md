@@ -25,10 +25,10 @@ We also provide the [pretrained models](https://drive.google.com/drive/folders/1
 
 
 ## Pre-requisites
-0. Python >= 3.6
+0. Python >= 3.9 (tested with PyTorch 2.x)
 0. Clone this repository
 0. Install python requirements. Please refer [requirements.txt](requirements.txt)
-    1. You may need to install espeak first: `apt-get install espeak`
+    1. You may need to install espeak first: `apt-get install espeak-ng`
 0. Download datasets
     1. Download and extract the LJ Speech dataset, then rename or create a link to the dataset folder: `ln -s /path/to/LJSpeech-1.1/wavs DUMMY1`
     1. For mult-speaker setting, download and extract the VCTK dataset, and downsample wav files to 22050 Hz. Then rename or create a link to the dataset folder: `ln -s /path/to/VCTK-Corpus/downsampled_wavs DUMMY2`
@@ -36,6 +36,7 @@ We also provide the [pretrained models](https://drive.google.com/drive/folders/1
 ```sh
 # Cython-version Monotonoic Alignment Search
 cd monotonic_align
+mkdir -p monotonic_align
 python setup.py build_ext --inplace
 
 # Preprocessing (g2p) for your own datasets. Preprocessed phonemes for LJ Speech and VCTK have been already provided.
@@ -56,3 +57,53 @@ python train_ms.py -c configs/vctk_base.json -m vctk_base
 
 ## Inference Example
 See [inference.ipynb](inference.ipynb)
+
+
+## Pronunciation Stability Improvements
+
+VITS is known to occasionally mispronounce or skip phonemes at inference even
+when the input phonemes are correct. The [VITS2 paper](https://arxiv.org/abs/2307.16430)
+attributes much of this to the stochastic duration predictor producing
+unnatural durations and to alignment errors made early in training. This fork
+adds the following mitigations:
+
+**Opt-in training options** (see `configs/ljs_base_stable.json` /
+`configs/vctk_base_stable.json`; enabled via the `model` section):
+- `use_duration_discriminator`: adversarial training of the duration predictor
+  against a VITS2-style duration discriminator, which produces more natural
+  durations and clearer pronunciation. The discriminator is a separate network
+  (checkpointed as `DUR_*.pth`) and does not change the synthesizer
+  architecture, so the resulting generator stays compatible with the original
+  inference code.
+- `use_noise_scaled_mas` (+ `mas_noise_scale_initial`, `noise_scale_delta`):
+  VITS2's noise-scaled Monotonic Alignment Search. Annealed Gaussian noise is
+  added to the alignment scores so MAS explores alternative alignments early in
+  training instead of committing to its first solution, yielding more accurate
+  phoneme-to-frame alignments.
+- `use_sdp: false` switches to the deterministic duration predictor, which
+  trades rhythm diversity for maximum pronunciation stability.
+
+**Opt-in architecture changes** (see `configs/ljs_vits2.json` /
+`configs/vctk_vits2.json`; these change the synthesizer architecture, so they
+require training from scratch — checkpoints are NOT interchangeable with the
+original architecture):
+- `use_transformer_flows` (+ `flow_transformer_n_layers`): replaces the
+  WaveNet blocks in the prior normalizing flow with small transformer blocks
+  (VITS2), giving the flow long-range context when transforming the prior.
+  The coupling projections are zero-initialized, so each coupling layer starts
+  as an identity map and training starts from the same dynamics as the
+  baseline.
+- `use_spk_conditioned_encoder`: conditions the text encoder on the speaker
+  embedding (VITS2), which improves pronunciation and speaker similarity in
+  multi-speaker models. It has no effect on single-speaker models.
+
+Note that these architecture options come from unofficial reproductions of
+VITS2 (no official code was released). If you observe training instability
+with `fp16_run: true`, disable mixed precision before drawing conclusions
+about the architecture.
+
+**Inference tips for stability** (no retraining needed): lower
+`noise_scale_w` (e.g. 0.6 instead of 0.8) to reduce duration randomness, and
+lower `noise_scale` (e.g. 0.5) to keep the acoustic latents closer to the
+prior mean; both reduce the chance of slurred or distorted phonemes at some
+cost in prosody variety.

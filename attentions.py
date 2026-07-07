@@ -11,7 +11,7 @@ from modules import LayerNorm
    
 
 class Encoder(nn.Module):
-  def __init__(self, hidden_channels, filter_channels, n_heads, n_layers, kernel_size=1, p_dropout=0., window_size=4, **kwargs):
+  def __init__(self, hidden_channels, filter_channels, n_heads, n_layers, kernel_size=1, p_dropout=0., window_size=4, gin_channels=0, **kwargs):
     super().__init__()
     self.hidden_channels = hidden_channels
     self.filter_channels = filter_channels
@@ -20,6 +20,10 @@ class Encoder(nn.Module):
     self.kernel_size = kernel_size
     self.p_dropout = p_dropout
     self.window_size = window_size
+    self.gin_channels = gin_channels
+
+    if gin_channels != 0:
+      self.cond = nn.Conv1d(gin_channels, hidden_channels, 1)
 
     self.drop = nn.Dropout(p_dropout)
     self.attn_layers = nn.ModuleList()
@@ -32,9 +36,11 @@ class Encoder(nn.Module):
       self.ffn_layers.append(FFN(hidden_channels, hidden_channels, filter_channels, kernel_size, p_dropout=p_dropout))
       self.norm_layers_2.append(LayerNorm(hidden_channels))
 
-  def forward(self, x, x_mask):
+  def forward(self, x, x_mask, g=None):
     attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
     x = x * x_mask
+    if g is not None:
+      x = (x + self.cond(g)) * x_mask
     for i in range(self.n_layers):
       y = self.attn_layers[i](x, x, attn_mask)
       y = self.drop(y)
