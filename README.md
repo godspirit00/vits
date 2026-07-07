@@ -83,6 +83,25 @@ adds the following mitigations:
 - `use_sdp: false` switches to the deterministic duration predictor, which
   trades rhythm diversity for maximum pronunciation stability.
 
+**Opt-in architecture changes** (see `configs/ljs_vits2.json` /
+`configs/vctk_vits2.json`; these change the synthesizer architecture, so they
+require training from scratch — checkpoints are NOT interchangeable with the
+original architecture):
+- `use_transformer_flows` (+ `flow_transformer_n_layers`): replaces the
+  WaveNet blocks in the prior normalizing flow with small transformer blocks
+  (VITS2), giving the flow long-range context when transforming the prior.
+  The coupling projections are zero-initialized, so each coupling layer starts
+  as an identity map and training starts from the same dynamics as the
+  baseline.
+- `use_spk_conditioned_encoder`: conditions the text encoder on the speaker
+  embedding (VITS2), which improves pronunciation and speaker similarity in
+  multi-speaker models. It has no effect on single-speaker models.
+
+Note that these architecture options come from unofficial reproductions of
+VITS2 (no official code was released). If you observe training instability
+with `fp16_run: true`, disable mixed precision before drawing conclusions
+about the architecture.
+
 **Inference tips for stability** (no retraining needed): lower
 `noise_scale_w` (e.g. 0.6 instead of 0.8) to reduce duration randomness, and
 lower `noise_scale` (e.g. 0.5) to keep the acoustic latents closer to the
