@@ -57,3 +57,34 @@ python train_ms.py -c configs/vctk_base.json -m vctk_base
 
 ## Inference Example
 See [inference.ipynb](inference.ipynb)
+
+
+## Pronunciation Stability Improvements
+
+VITS is known to occasionally mispronounce or skip phonemes at inference even
+when the input phonemes are correct. The [VITS2 paper](https://arxiv.org/abs/2307.16430)
+attributes much of this to the stochastic duration predictor producing
+unnatural durations and to alignment errors made early in training. This fork
+adds the following mitigations:
+
+**Opt-in training options** (see `configs/ljs_base_stable.json` /
+`configs/vctk_base_stable.json`; enabled via the `model` section):
+- `use_duration_discriminator`: adversarial training of the duration predictor
+  against a VITS2-style duration discriminator, which produces more natural
+  durations and clearer pronunciation. The discriminator is a separate network
+  (checkpointed as `DUR_*.pth`) and does not change the synthesizer
+  architecture, so the resulting generator stays compatible with the original
+  inference code.
+- `use_noise_scaled_mas` (+ `mas_noise_scale_initial`, `noise_scale_delta`):
+  VITS2's noise-scaled Monotonic Alignment Search. Annealed Gaussian noise is
+  added to the alignment scores so MAS explores alternative alignments early in
+  training instead of committing to its first solution, yielding more accurate
+  phoneme-to-frame alignments.
+- `use_sdp: false` switches to the deterministic duration predictor, which
+  trades rhythm diversity for maximum pronunciation stability.
+
+**Inference tips for stability** (no retraining needed): lower
+`noise_scale_w` (e.g. 0.6 instead of 0.8) to reduce duration randomness, and
+lower `noise_scale` (e.g. 0.5) to keep the acoustic latents closer to the
+prior mean; both reduce the chance of slurred or distorted phonemes at some
+cost in prosody variety.

@@ -95,6 +95,81 @@ class StochasticDurationPredictor(nn.Module):
       return logw
 
 
+class DurationDiscriminator(nn.Module):
+  """Duration discriminator from VITS2 (https://arxiv.org/abs/2307.16430).
+
+  Discriminates between durations extracted by monotonic alignment search
+  (real) and durations produced by the duration predictor (generated),
+  conditioned on the text-encoder hidden states. Training the duration
+  predictor adversarially against it yields more natural durations and
+  clearer pronunciation than the likelihood-based objective alone.
+  """
+  def __init__(self, in_channels, filter_channels, kernel_size, p_dropout, gin_channels=0):
+    super().__init__()
+
+    self.in_channels = in_channels
+    self.filter_channels = filter_channels
+    self.kernel_size = kernel_size
+    self.p_dropout = p_dropout
+    self.gin_channels = gin_channels
+
+    self.drop = nn.Dropout(p_dropout)
+    self.conv_1 = nn.Conv1d(in_channels, filter_channels, kernel_size, padding=kernel_size//2)
+    self.norm_1 = modules.LayerNorm(filter_channels)
+    self.conv_2 = nn.Conv1d(filter_channels, filter_channels, kernel_size, padding=kernel_size//2)
+    self.norm_2 = modules.LayerNorm(filter_channels)
+    self.dur_proj = nn.Conv1d(1, filter_channels, 1)
+
+    self.pre_out_conv_1 = nn.Conv1d(2*filter_channels, filter_channels, kernel_size, padding=kernel_size//2)
+    self.pre_out_norm_1 = modules.LayerNorm(filter_channels)
+    self.pre_out_conv_2 = nn.Conv1d(filter_channels, filter_channels, kernel_size, padding=kernel_size//2)
+    self.pre_out_norm_2 = modules.LayerNorm(filter_channels)
+
+    if gin_channels != 0:
+      self.cond = nn.Conv1d(gin_channels, in_channels, 1)
+
+    self.output_layer = nn.Sequential(
+        nn.Linear(filter_channels, 1),
+        nn.Sigmoid()
+    )
+
+  def forward_probability(self, x, x_mask, dur):
+    dur = self.dur_proj(dur)
+    x = torch.cat([x, dur], dim=1)
+    x = self.pre_out_conv_1(x * x_mask)
+    x = torch.relu(x)
+    x = self.pre_out_norm_1(x)
+    x = self.drop(x)
+    x = self.pre_out_conv_2(x * x_mask)
+    x = torch.relu(x)
+    x = self.pre_out_norm_2(x)
+    x = self.drop(x)
+    x = x * x_mask
+    x = x.transpose(1, 2)
+    output_prob = self.output_layer(x)
+    return output_prob
+
+  def forward(self, x, x_mask, dur_r, dur_hat, g=None):
+    x = torch.detach(x)
+    if g is not None:
+      g = torch.detach(g)
+      x = x + self.cond(g)
+    x = self.conv_1(x * x_mask)
+    x = torch.relu(x)
+    x = self.norm_1(x)
+    x = self.drop(x)
+    x = self.conv_2(x * x_mask)
+    x = torch.relu(x)
+    x = self.norm_2(x)
+    x = self.drop(x)
+
+    output_probs = []
+    for dur in [dur_r, dur_hat]:
+      output_probs.append(self.forward_probability(x, x_mask, dur))
+
+    return output_probs
+
+
 class DurationPredictor(nn.Module):
   def __init__(self, in_channels, filter_channels, kernel_size, p_dropout, gin_channels=0):
     super().__init__()
@@ -412,6 +487,9 @@ class SynthesizerTrn(nn.Module):
     n_speakers=0,
     gin_channels=0,
     use_sdp=True,
+    use_noise_scaled_mas=False,
+    mas_noise_scale_initial=0.01,
+    noise_scale_delta=2e-6,
     **kwargs):
 
     super().__init__()
@@ -435,6 +513,10 @@ class SynthesizerTrn(nn.Module):
     self.gin_channels = gin_channels
 
     self.use_sdp = use_sdp
+    self.use_noise_scaled_mas = use_noise_scaled_mas
+    self.mas_noise_scale_initial = mas_noise_scale_initial
+    self.noise_scale_delta = noise_scale_delta
+    self.current_mas_noise_scale = mas_noise_scale_initial if use_noise_scaled_mas else 0.0
 
     self.enc_p = TextEncoder(n_vocab,
         inter_channels,
@@ -475,18 +557,25 @@ class SynthesizerTrn(nn.Module):
       neg_cent3 = torch.matmul(z_p.transpose(1, 2), (m_p * s_p_sq_r)) # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
       neg_cent4 = torch.sum(-0.5 * (m_p ** 2) * s_p_sq_r, [1], keepdim=True) # [b, 1, t_s]
       neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
+      if self.use_noise_scaled_mas:
+        # VITS2: perturb the alignment search with annealed Gaussian noise so
+        # that MAS explores alternative (potentially better) alignments early
+        # in training instead of locking in on its first solution.
+        epsilon = torch.std(neg_cent) * torch.randn_like(neg_cent) * self.current_mas_noise_scale
+        neg_cent = neg_cent + epsilon
 
       attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
       attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach()
 
     w = attn.sum(2)
+    logw_ = torch.log(w + 1e-6) * x_mask
     if self.use_sdp:
       l_length = self.dp(x, x_mask, w, g=g)
       l_length = l_length / torch.sum(x_mask)
+      logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=1.0)
     else:
-      logw_ = torch.log(w + 1e-6) * x_mask
       logw = self.dp(x, x_mask, g=g)
-      l_length = torch.sum((logw - logw_)**2, [1,2]) / torch.sum(x_mask) # for averaging 
+      l_length = torch.sum((logw - logw_)**2, [1,2]) / torch.sum(x_mask) # for averaging
 
     # expand prior
     m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
@@ -494,7 +583,7 @@ class SynthesizerTrn(nn.Module):
 
     z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
     o = self.dec(z_slice, g=g)
-    return o, l_length, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+    return o, l_length, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), (x, logw, logw_)
 
   def infer(self, x, x_lengths, sid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None):
     x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
