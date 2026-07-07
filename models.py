@@ -217,7 +217,8 @@ class TextEncoder(nn.Module):
       n_layers,
       kernel_size,
       p_dropout,
-      gin_channels=0):
+      gin_channels=0,
+      bert_dim=0):
     super().__init__()
     self.n_vocab = n_vocab
     self.out_channels = out_channels
@@ -228,9 +229,19 @@ class TextEncoder(nn.Module):
     self.kernel_size = kernel_size
     self.p_dropout = p_dropout
     self.gin_channels = gin_channels
+    self.bert_dim = bert_dim
 
     self.emb = nn.Embedding(n_vocab, hidden_channels)
     nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
+
+    if bert_dim > 0:
+      # Projects phoneme-level PL-BERT embeddings into the encoder. Zero-
+      # initialized so the branch starts as a no-op and training begins from
+      # the same dynamics as the baseline (also allows warm-starting from a
+      # checkpoint trained without PL-BERT).
+      self.bert_proj = nn.Conv1d(bert_dim, hidden_channels, 1)
+      self.bert_proj.weight.data.zero_()
+      self.bert_proj.bias.data.zero_()
 
     self.encoder = attentions.Encoder(
       hidden_channels,
@@ -242,8 +253,10 @@ class TextEncoder(nn.Module):
       gin_channels=gin_channels)
     self.proj= nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
-  def forward(self, x, x_lengths, g=None):
+  def forward(self, x, x_lengths, bert=None, g=None):
     x = self.emb(x) * math.sqrt(self.hidden_channels) # [b, t, h]
+    if bert is not None:
+      x = x + self.bert_proj(bert).transpose(1, 2) # [b, t, h]
     x = torch.transpose(x, 1, -1) # [b, h, t]
     x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
 
@@ -587,6 +600,8 @@ class SynthesizerTrn(nn.Module):
     use_transformer_flows=False,
     flow_transformer_n_layers=2,
     use_spk_conditioned_encoder=False,
+    use_plbert=False,
+    plbert_dim=768,
     **kwargs):
 
     super().__init__()
@@ -616,6 +631,8 @@ class SynthesizerTrn(nn.Module):
     self.current_mas_noise_scale = mas_noise_scale_initial if use_noise_scaled_mas else 0.0
     self.use_transformer_flows = use_transformer_flows
     self.use_spk_conditioned_encoder = use_spk_conditioned_encoder and gin_channels > 0 and n_speakers > 1
+    self.use_plbert = use_plbert
+    self.plbert_dim = plbert_dim
 
     self.enc_p = TextEncoder(n_vocab,
         inter_channels,
@@ -625,7 +642,8 @@ class SynthesizerTrn(nn.Module):
         n_layers,
         kernel_size,
         p_dropout,
-        gin_channels=gin_channels if self.use_spk_conditioned_encoder else 0)
+        gin_channels=gin_channels if self.use_spk_conditioned_encoder else 0,
+        bert_dim=plbert_dim if use_plbert else 0)
     self.dec = Generator(inter_channels, resblock, resblock_kernel_sizes, resblock_dilation_sizes, upsample_rates, upsample_initial_channel, upsample_kernel_sizes, gin_channels=gin_channels)
     self.enc_q = PosteriorEncoder(spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels)
     if use_transformer_flows:
@@ -641,14 +659,14 @@ class SynthesizerTrn(nn.Module):
     if n_speakers > 1:
       self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
-  def forward(self, x, x_lengths, y, y_lengths, sid=None):
+  def forward(self, x, x_lengths, y, y_lengths, sid=None, bert=None):
 
     if self.n_speakers > 0:
       g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
     else:
       g = None
 
-    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g if self.use_spk_conditioned_encoder else None)
+    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, bert=bert, g=g if self.use_spk_conditioned_encoder else None)
 
     z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
     z_p = self.flow(z, y_mask, g=g)
@@ -689,13 +707,13 @@ class SynthesizerTrn(nn.Module):
     o = self.dec(z_slice, g=g)
     return o, l_length, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), (x, logw, logw_)
 
-  def infer(self, x, x_lengths, sid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None):
+  def infer(self, x, x_lengths, sid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None, bert=None):
     if self.n_speakers > 0:
       g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
     else:
       g = None
 
-    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g if self.use_spk_conditioned_encoder else None)
+    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, bert=bert, g=g if self.use_spk_conditioned_encoder else None)
 
     if self.use_sdp:
       logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)

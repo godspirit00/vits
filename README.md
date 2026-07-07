@@ -107,3 +107,58 @@ about the architecture.
 lower `noise_scale` (e.g. 0.5) to keep the acoustic latents closer to the
 prior mean; both reduce the chance of slurred or distorted phonemes at some
 cost in prosody variety.
+
+
+## PL-BERT for More Natural Prosody
+
+This fork can condition the text encoder on
+[PL-BERT](https://github.com/yl4579/PL-BERT) (Phoneme-Level BERT), a BERT
+pretrained on phonemized Wikipedia to predict masked phonemes and the
+graphemes they came from. Its phoneme-level hidden states carry contextual /
+semantic information that plain phoneme embeddings lack, which improves the
+naturalness of prosody (this is the same component that StyleTTS 2 uses for
+human-level naturalness). The embeddings are added to the phoneme embeddings
+inside the text encoder, so they influence both the prior distribution and
+the duration predictor.
+
+Setup:
+
+1. Install the extra dependencies (`transformers`, `PyYAML`), included in
+   [requirements.txt](requirements.txt).
+2. Download the pretrained English PL-BERT checkpoint — the directory must
+   contain `config.yml` and a `step_*.t7` checkpoint. The official one
+   (trained 1M steps on English Wikipedia) is available from the
+   [PL-BERT repo](https://github.com/yl4579/PL-BERT) (Google Drive link in
+   its README), and is also shipped in the StyleTTS 2 repo under
+   [`Utils/PLBERT`](https://github.com/yl4579/StyleTTS2/tree/main/Utils/PLBERT).
+   Place both files in e.g. `./plbert_checkpoints/english/`.
+3. Train with a PL-BERT config (see `configs/ljs_plbert.json` /
+   `configs/vctk_plbert.json`; based on the VITS2 configs above):
+
+```sh
+python train.py -c configs/ljs_plbert.json -m ljs_plbert
+```
+
+The relevant `model` options are `use_plbert` (enable the conditioning),
+`plbert_dir` (path to the checkpoint directory) and `plbert_dim` (hidden size
+of the checkpoint; 768 for the official one). PL-BERT itself stays frozen and
+is not stored in the `G_*.pth` checkpoints — only a small projection layer
+(`enc_p.bert_proj`) is added to the synthesizer, and it is zero-initialized,
+so you can warm-start from a checkpoint trained without PL-BERT
+(`utils.load_checkpoint` keeps the zero initialization for the missing
+projection weights and training starts from the exact same model).
+
+Notes:
+- PL-BERT was trained on IPA phoneme sequences produced with espeak
+  (`phonemizer`), which matches the `english_cleaners2` cleaner used by the
+  provided configs. Its symbol set is identical to `text/symbols.py`, and the
+  token ids are remapped automatically (unknown symbols fall back to
+  PL-BERT's convention of `'U'`). With `add_blank: true` the interleaved
+  blanks are stripped before PL-BERT and its output is expanded back onto the
+  blank-interleaved grid.
+- For non-English models, train or download a PL-BERT for your language
+  (e.g. the multilingual PL-BERT from the StyleTTS 2 community) and point
+  `plbert_dir` at it.
+- At inference you must compute the PL-BERT features for the input text and
+  pass them to `infer` — see the PL-BERT section of
+  [inference.ipynb](inference.ipynb).

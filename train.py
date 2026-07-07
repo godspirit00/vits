@@ -81,6 +81,13 @@ def run(rank, n_gpus, hps):
         batch_size=hps.train.batch_size, pin_memory=True,
         drop_last=False, collate_fn=collate_fn)
 
+  if getattr(hps.model, "use_plbert", False):
+    from plbert import PLBertEmbedder
+    plbert = PLBertEmbedder(hps.model.plbert_dir, add_blank=hps.data.add_blank).cuda(rank)
+    plbert.eval()
+  else:
+    plbert = None
+
   net_g = SynthesizerTrn(
       len(symbols),
       hps.data.filter_length // 2 + 1,
@@ -138,9 +145,9 @@ def run(rank, n_gpus, hps):
 
   for epoch in range(epoch_str, hps.train.epochs + 1):
     if rank==0:
-      train_and_evaluate(rank, epoch, hps, [net_g, net_d, net_dur_disc], [optim_g, optim_d, optim_dur_disc], [scheduler_g, scheduler_d, scheduler_dur_disc], scaler, [train_loader, eval_loader], logger, [writer, writer_eval])
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d, net_dur_disc, plbert], [optim_g, optim_d, optim_dur_disc], [scheduler_g, scheduler_d, scheduler_dur_disc], scaler, [train_loader, eval_loader], logger, [writer, writer_eval])
     else:
-      train_and_evaluate(rank, epoch, hps, [net_g, net_d, net_dur_disc], [optim_g, optim_d, optim_dur_disc], [scheduler_g, scheduler_d, scheduler_dur_disc], scaler, [train_loader, None], None, None)
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d, net_dur_disc, plbert], [optim_g, optim_d, optim_dur_disc], [scheduler_g, scheduler_d, scheduler_dur_disc], scaler, [train_loader, None], None, None)
     scheduler_g.step()
     scheduler_d.step()
     if scheduler_dur_disc is not None:
@@ -148,7 +155,7 @@ def run(rank, n_gpus, hps):
 
 
 def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers):
-  net_g, net_d, net_dur_disc = nets
+  net_g, net_d, net_dur_disc, plbert = nets
   optim_g, optim_d, optim_dur_disc = optims
   scheduler_g, scheduler_d, scheduler_dur_disc = schedulers
   train_loader, eval_loader = loaders
@@ -167,13 +174,15 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     spec, spec_lengths = spec.cuda(rank, non_blocking=True), spec_lengths.cuda(rank, non_blocking=True)
     y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(rank, non_blocking=True)
 
+    bert = plbert(x, x_lengths) if plbert is not None else None
+
     if net_g.module.use_noise_scaled_mas:
       net_g.module.current_mas_noise_scale = max(
           net_g.module.mas_noise_scale_initial - net_g.module.noise_scale_delta * global_step, 0.0)
 
     with autocast('cuda', enabled=hps.train.fp16_run):
       y_hat, l_length, attn, ids_slice, x_mask, z_mask,\
-      (z, z_p, m_p, logs_p, m_q, logs_q), (hidden_x, logw, logw_) = net_g(x, x_lengths, spec, spec_lengths)
+      (z, z_p, m_p, logs_p, m_q, logs_q), (hidden_x, logw, logw_) = net_g(x, x_lengths, spec, spec_lengths, bert=bert)
 
       mel = spec_to_mel_torch(
           spec, 
@@ -275,7 +284,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
           scalars=scalar_dict)
 
       if global_step % hps.train.eval_interval == 0:
-        evaluate(hps, net_g, eval_loader, writer_eval)
+        evaluate(hps, net_g, eval_loader, writer_eval, plbert)
         utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "G_{}.pth".format(global_step)))
         utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "D_{}.pth".format(global_step)))
         if net_dur_disc is not None:
@@ -286,7 +295,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     logger.info('====> Epoch: {}'.format(epoch))
 
  
-def evaluate(hps, generator, eval_loader, writer_eval):
+def evaluate(hps, generator, eval_loader, writer_eval, plbert=None):
     generator.eval()
     with torch.no_grad():
       for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths) in enumerate(eval_loader):
@@ -302,7 +311,8 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         y = y[:1]
         y_lengths = y_lengths[:1]
         break
-      y_hat, attn, mask, *_ = generator.module.infer(x, x_lengths, max_len=1000)
+      bert = plbert(x, x_lengths) if plbert is not None else None
+      y_hat, attn, mask, *_ = generator.module.infer(x, x_lengths, max_len=1000, bert=bert)
       y_hat_lengths = mask.sum([1,2]).long() * hps.data.hop_length
 
       mel = spec_to_mel_torch(
