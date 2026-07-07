@@ -17,7 +17,7 @@ logger = logging
 
 def load_checkpoint(checkpoint_path, model, optimizer=None):
   assert os.path.isfile(checkpoint_path)
-  checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
+  checkpoint_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
   iteration = checkpoint_dict['iteration']
   learning_rate = checkpoint_dict['learning_rate']
   if optimizer is not None:
@@ -95,8 +95,7 @@ def plot_spectrogram_to_numpy(spectrogram):
   plt.tight_layout()
 
   fig.canvas.draw()
-  data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-  data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+  data = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)[..., :3]
   plt.close()
   return data
 
@@ -124,8 +123,7 @@ def plot_alignment_to_numpy(alignment, info=None):
   plt.tight_layout()
 
   fig.canvas.draw()
-  data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-  data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+  data = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)[..., :3]
   plt.close()
   return data
 
@@ -194,7 +192,7 @@ def get_hparams_from_file(config_path):
 def check_git_hash(model_dir):
   source_dir = os.path.dirname(os.path.realpath(__file__))
   if not os.path.exists(os.path.join(source_dir, ".git")):
-    logger.warn("{} is not a git repository, therefore hash value comparison will be ignored.".format(
+    logger.warning("{} is not a git repository, therefore hash value comparison will be ignored.".format(
       source_dir
     ))
     return
@@ -205,7 +203,7 @@ def check_git_hash(model_dir):
   if os.path.exists(path):
     saved_hash = open(path).read()
     if saved_hash != cur_hash:
-      logger.warn("git hash values are different. {}(saved) != {}(current)".format(
+      logger.warning("git hash values are different. {}(saved) != {}(current)".format(
         saved_hash[:8], cur_hash[:8]))
   else:
     open(path, "w").write(cur_hash)
